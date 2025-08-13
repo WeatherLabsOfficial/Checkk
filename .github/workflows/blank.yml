@@ -1,0 +1,104 @@
+name: Persistent Pterodactyl VPS
+
+on:
+  workflow_dispatch:   # Manual run option
+  schedule:
+    - cron: '*/30 * * * *' # Har 30 minute me auto-run (optional)
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt update
+          sudo apt install -y tmate curl unzip sudo net-tools neofetch mariadb-server tar gzip gh
+
+      # Restore backup if available
+      - name: Download backup parts
+        uses: actions/download-artifact@v4
+        with:
+          name: vps-backup
+          path: ./restore
+        continue-on-error: true
+
+      - name: Merge and extract backup
+        run: |
+          if ls ./restore/backup-part* 1> /dev/null 2>&1; then
+            cat ./restore/backup-part* > full-backup.tar.gz
+            sudo tar -xzp -C / -f full-backup.tar.gz
+            echo "✅ Backup restored!"
+          else
+            echo "ℹ️ No backup found, starting fresh"
+          fi
+
+      # Restore Database
+      - name: Restore MariaDB
+        run: |
+          if [ -f /root/ptero-db.sql ]; then
+            sudo service mariadb start
+            sudo mysql < /root/ptero-db.sql
+          fi
+
+      # Tailscale setup
+      - name: Install Tailscale
+        run: curl -fsSL https://tailscale.com/install.sh | sh
+
+      - name: Start Tailscale
+        run: |
+          sudo tailscaled &
+          sleep 8
+          sudo tailscale up --authkey ${{ secrets.TAILSCALE_AUTHKEY }} --hostname=ptero-vps || echo "Tailscale already running"
+
+      # SSH Access
+      - name: Start SSH session
+        uses: mxschmitt/action-tmate@v3
+
+      # Continuous Backup Loop (Safe Delete Logic)
+      - name: Continuous backup loop
+        run: |
+          sudo service mariadb start
+          while true; do
+            echo "⏳ Naya backup ban raha hai..."
+            sudo mysqldump --all-databases > /root/ptero-db.sql
+            if [ $? -ne 0 ]; then
+              echo "❌ Database dump fail, purana backup safe rahega."
+              sleep 180
+              continue
+            fi
+
+            sudo tar -czp \
+              /var/www/pterodactyl \
+              /var/lib/pterodactyl \
+              /etc/pterodactyl \
+              /etc/nginx \
+              /etc/letsencrypt \
+              /var/lib/mysql \
+              /root/.cloudflared \
+              /root/ptero-db.sql \
+              /var/lib/tailscale/tailscaled.state \
+> full-backup.tar.gz
+
+            if [ $? -eq 0 ]; then
+              echo "✅ Naya backup successfully ban gaya, ab purana delete ho raha hai..."
+              OLD_ID=$(gh api /repos/${{ github.repository }}/actions/artifacts \
+                --jq '.artifacts[] | select(.name=="vps-backup") | .id' | head -n 1)
+              if [ -n "$OLD_ID" ]; then
+                gh api --method DELETE /repos/${{ github.repository }}/actions/artifacts/$OLD_ID
+              fi
+            else
+              echo "❌ Backup banane me error, purana safe rakha gaya."
+              sleep 180
+              continue
+            fi
+
+            # Naya backup upload
+            split -b 2000M full-backup.tar.gz backup-part
+            echo "⬆️ Backup upload ho raha hai..."
+            gh release create $(date +'%Y%m%d%H%M%S') backup-part* --title "Auto Backup $(date)" --notes "Automated backup" || echo "⚠️ Upload fail"
+
+            echo "💤 Sleeping 3 minutes..."
+            sleep 180
+          done
