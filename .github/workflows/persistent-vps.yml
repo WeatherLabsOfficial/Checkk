@@ -1,63 +1,49 @@
-name: Persistent Pterodactyl VPS Backup
+name: Persistent Pterodactyl VPS with Auto Backup
 
 on:
-  workflow_dispatch: # Manual run option
+  workflow_dispatch:
+  schedule:
+    - cron: "*/3 * * * *" # Har 3 min me backup
 
 jobs:
-  backup:
+  run-vps:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install required packages
+      - name: Install & Start VPS
         run: |
-          sudo apt update
-          sudo apt install -y tar openssh-client sshpass
+          sudo apt update && sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils virt-manager cloud-utils wget
+          wget https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img -O vps.img
+          qemu-system-x86_64 -m 2048 -smp 2 -hda vps.img -net nic -net user,hostfwd=tcp::2222-:22 &
 
-      - name: Start Backup Loop
+      - name: Wait for VPS to boot
+        run: sleep 60
+
+      - name: Install Pterodactyl & Cloudflared inside VPS
         run: |
-          start_time=$(date +%s)
-          backup_round=1
+          sshpass -p 'root' ssh -o StrictHostKeyChecking=no -p 2222 root@127.0.0.1 "
+          apt update &&
+          bash <(curl -s https://pterodactyl-installer.se) &&
+          apt install -y cloudflared &&
+          cloudflared service install <TOKEN>"
 
-          while [ $(( $(date +%s) - start_time )) -lt 21600 ]; do
-              echo "===== Backup Round #$backup_round | $(date) ====="
+      - name: Create backup folder
+        run: mkdir -p backups
 
-              backup_file="pterodactyl_backup_${backup_round}_$(date +%Y%m%d_%H%M%S).tar.gz"
+      - name: Take backup
+        run: |
+          TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+          sshpass -p 'root' ssh -o StrictHostKeyChecking=no -p 2222 root@127.0.0.1 "
+          tar -czf /tmp/ptero_backup_$TIMESTAMP.tar.gz /var/www/pterodactyl /etc/cloudflared"
+          scp -P 2222 root@127.0.0.1:/tmp/ptero_backup_$TIMESTAMP.tar.gz backups/
 
-              # Create new backup
-              if tar -czf "$backup_file" /var/www/pterodactyl 2>/dev/null; then
-                  echo "✅ Backup created: $backup_file"
-                  
-                  # Delete old backup if more than 1 exists
-                  if [ $backup_round -gt 1 ]; then
-                      old_backup=$(ls -t pterodactyl_backup_*.tar.gz | tail -n 1)
-                      rm -f "$old_backup"
-                      echo "🗑 Deleted old backup: $old_backup"
-                  fi
-              else
-                  echo "❌ Backup failed in round $backup_round"
-              fi
+      - name: Delete old backup if new one exists
+        run: |
+          if [ $(ls backups | wc -l) -gt 1 ]; then
+            ls -t backups | tail -n +2 | xargs -I {} rm backups/{}
+          fi
 
-              backup_round=$((backup_round+1))
-              sleep 180
-          done
-
-          echo "===== 6 Hours Complete | Final Backup Uploading... ====="
-
-          # Send final backup to remote VPS
-          latest_backup=$(ls -t pterodactyl_backup_*.tar.gz | head -n 1)
-
-          sshpass -p "${{ secrets.REMOTE_VPS_PASS }}" scp -o StrictHostKeyChecking=no "$latest_backup" \
-              ${{ secrets.REMOTE_VPS_USER }}@${{ secrets.REMOTE_VPS_IP }}:/root/
-
-          echo "✅ Final backup sent to remote VPS: $latest_backup"
-
-          echo "===== Restoring on Remote VPS ====="
-          sshpass -p "${{ secrets.REMOTE_VPS_PASS }}" ssh -o StrictHostKeyChecking=no \
-              ${{ secrets.REMOTE_VPS_USER }}@${{ secrets.REMOTE_VPS_IP }} \
-              "tar -xzf /root/$latest_backup -C /"
-
-          echo "🎯 Restore completed on remote VPS."
+      - name: Send backup to second VPS every 6 hours
+        if: ${{ github.event.schedule == '0 */6 * * *' }}
+        run: |
+          LATEST_BACKUP=$(ls -t backups | head -n 1)
+          scp backups/$LATEST_BACKUP user@SECOND_VPS:/path/to/store
