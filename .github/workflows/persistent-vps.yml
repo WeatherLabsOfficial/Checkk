@@ -1,116 +1,63 @@
-name: Persistent Pterodactyl VPS
+name: Persistent Pterodactyl VPS Backup
 
 on:
-  workflow_dispatch:
-  schedule:
-    - cron: '*/30 * * * *'
+  workflow_dispatch: # Manual run option
 
 jobs:
-  vps:
+  backup:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
-
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      REMOTE_VPS_IP: ${{ secrets.REMOTE_VPS_IP }}
-      REMOTE_VPS_USER: ${{ secrets.REMOTE_VPS_USER }}
-      REMOTE_VPS_PASS: ${{ secrets.REMOTE_VPS_PASS }}
-
     steps:
-      - name: Install tools
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install required packages
         run: |
           sudo apt update
-          sudo apt install -y tmate curl unzip sudo net-tools neofetch mariadb-server tar gzip gh sshpass
+          sudo apt install -y tar openssh-client sshpass
 
-      - name: GitHub CLI Auth
-        run: echo "${GITHUB_TOKEN}" | gh auth login --with-token
-
-      - name: Download backup parts
-        uses: actions/download-artifact@v4
-        with:
-          name: vps-backup
-          path: ./restore
-        continue-on-error: true
-
-      - name: Merge and extract backup
+      - name: Start Backup Loop
         run: |
-          if ls ./restore/backup-part* 1> /dev/null 2>&1; then
-            cat ./restore/backup-part* > full-backup.tar.gz
-            sudo tar -xzp -C / -f full-backup.tar.gz
-            echo "✅ Backup restored!"
-          else
-            echo "ℹ️ No backup found, starting fresh"
-          fi
+          start_time=$(date +%s)
+          backup_round=1
 
-      - name: Restore MariaDB
-        run: |
-          if [ -f /root/ptero-db.sql ]; then
-            sudo service mariadb start
-            sudo mysql < /root/ptero-db.sql
-          fi
+          while [ $(( $(date +%s) - start_time )) -lt 21600 ]; do
+              echo "===== Backup Round #$backup_round | $(date) ====="
 
-      - name: Install Tailscale
-        run: curl -fsSL https://tailscale.com/install.sh | sh
+              backup_file="pterodactyl_backup_${backup_round}_$(date +%Y%m%d_%H%M%S).tar.gz"
 
-      - name: Start Tailscale
-        run: |
-          sudo tailscaled &
-          sleep 8
-          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname=ptero-vps || echo "Tailscale already running"
-
-      - name: Start SSH session
-        uses: mxschmitt/action-tmate@v3
-
-      - name: Continuous backup loop (3 min interval)
-        run: |
-          sudo service mariadb start
-          END_TIME=$((SECONDS + 21600))
-          while [ $SECONDS -lt $END_TIME ]; do
-            echo "⏳ Naya backup ban raha hai..."
-            sudo mysqldump --all-databases > /root/ptero-db.sql
-            if [ $? -ne 0 ]; then
-              echo "❌ Database dump fail, purana backup safe rahega."
-              sleep 180
-              continue
-            fi
-
-            sudo tar -czp \
-              /var/www/pterodactyl \
-              /var/lib/pterodactyl \
-              /etc/pterodactyl \
-              /etc/nginx \
-              /etc/letsencrypt \
-              /var/lib/mysql \
-              /root/.cloudflared \
-              /root/ptero-db.sql \
-              /var/lib/tailscale/tailscaled.state \
-              > full-backup.tar.gz
-
-            if [ $? -eq 0 ]; then
-              echo "✅ Naya backup successfully ban gaya, ab purana delete ho raha hai..."
-              OLD_ID=$(gh api /repos/${{ github.repository }}/actions/artifacts \
-                --jq '.artifacts[] | select(.name=="vps-backup") | .id' | head -n 1)
-              if [ -n "$OLD_ID" ]; then
-                gh api --method DELETE /repos/${{ github.repository }}/actions/artifacts/$OLD_ID
+              # Create new backup
+              if tar -czf "$backup_file" /var/www/pterodactyl 2>/dev/null; then
+                  echo "✅ Backup created: $backup_file"
+                  
+                  # Delete old backup if more than 1 exists
+                  if [ $backup_round -gt 1 ]; then
+                      old_backup=$(ls -t pterodactyl_backup_*.tar.gz | tail -n 1)
+                      rm -f "$old_backup"
+                      echo "🗑 Deleted old backup: $old_backup"
+                  fi
+              else
+                  echo "❌ Backup failed in round $backup_round"
               fi
-            else
-              echo "❌ Backup banane me error, purana safe rakha gaya."
+
+              backup_round=$((backup_round+1))
               sleep 180
-              continue
-            fi
-
-            split -b 2000M full-backup.tar.gz backup-part
-            echo "⬆️ Backup upload ho raha hai..."
-            gh release create $(date +'%Y%m%d%H%M%S') backup-part* --title "Auto Backup $(date)" --notes "Automated backup" || echo "⚠️ Upload fail"
-
-            echo "💤 Sleeping 3 minutes..."
-            sleep 180
           done
 
-      - name: Restore to remote VPS after 6h
-        run: |
-          echo "🔄 Final backup remote VPS me bheja ja raha hai..."
-          sshpass -p "${REMOTE_VPS_PASS}" scp -o StrictHostKeyChecking=no full-backup.tar.gz ${REMOTE_VPS_USER}@${REMOTE_VPS_IP}:/root/
-          sshpass -p "${REMOTE_VPS_PASS}" ssh -o StrictHostKeyChecking=no ${REMOTE_VPS_USER}@${REMOTE_VPS_IP} "sudo tar -xzp -C / -f /root/full-backup.tar.gz && sudo service mariadb start && if [ -f /root/ptero-db.sql ]; then sudo mysql < /root/ptero-db.sql; fi"
-          echo "✅ Remote VPS restore complete!"
+          echo "===== 6 Hours Complete | Final Backup Uploading... ====="
+
+          # Send final backup to remote VPS
+          latest_backup=$(ls -t pterodactyl_backup_*.tar.gz | head -n 1)
+
+          sshpass -p "${{ secrets.REMOTE_VPS_PASS }}" scp -o StrictHostKeyChecking=no "$latest_backup" \
+              ${{ secrets.REMOTE_VPS_USER }}@${{ secrets.REMOTE_VPS_IP }}:/root/
+
+          echo "✅ Final backup sent to remote VPS: $latest_backup"
+
+          echo "===== Restoring on Remote VPS ====="
+          sshpass -p "${{ secrets.REMOTE_VPS_PASS }}" ssh -o StrictHostKeyChecking=no \
+              ${{ secrets.REMOTE_VPS_USER }}@${{ secrets.REMOTE_VPS_IP }} \
+              "tar -xzf /root/$latest_backup -C /"
+
+          echo "🎯 Restore completed on remote VPS."
